@@ -1,0 +1,108 @@
+# Docker
+
+# Build a Docker image
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+# pr:
+#   branches:
+#     include:
+#       - main
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+# resources:
+#   - repo: self
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: "Caput ACR"
+  imageRepository: "healthchecks"
+  containerRegistry: "caputenergy.azurecr.io"
+  dockerfilePath: "$(Build.SourcesDirectory)/docker/Dockerfile"
+  buildId: "$(Build.BuildId)"
+  sha: "$(Build.SourceVersion)"
+  # no way of getting default branch name here so hardcode to main (used as var thereafter)
+  ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+    versionTag: $[ format('{0}-{1}', variables['Build.BuildId'], variables['Build.SourceBranchName']) ]
+  ${{ elseif eq(variables['Build.SourceBranch'], 'refs/heads/staging') }}:
+    versionTag: $[ format('{0}-{1}', variables['Build.BuildId'], 'staging') ]
+  ${{ else }}:
+    versionTag: $[ format('{0}-{1}', variables['Build.BuildId'], 'dev') ]
+
+stages:
+  - stage: PreBuild
+    displayName: Pre Build
+    jobs:
+      - job: CheckVars
+        displayName: Build metadata
+        steps:
+          # get a build id
+          - bash: |
+              echo Build.SourceBranchName = '$(Build.SourceBranchName)'
+              echo versionTag = '$(versionTag)'
+            displayName: Get build vars
+          # create metadata file
+          - bash: |
+              export OUTPUT_PATH=${1:-"$(Build.ArtifactStagingDirectory)/metadata/public"}
+              mkdir -p $OUTPUT_PATH
+              export VERSION_MANIFEST_FILE="${OUTPUT_PATH}/build.json"
+              echo "writing metadata blob to ${VERSION_MANIFEST_FILE}"
+              echo "{}" |
+                jq ".git_sha=\"$(Build.SourceVersion)\"" |
+                jq ".git_tag=\"$(versionTag)\"" |
+                jq ".git_branch=\"$(Build.SourceBranchName)\"" |
+                jq ".build_id=\"$(Build.BuildId)\"" |
+                jq ".build_pipeline=\"$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)\"" |
+                jq ".build_time_utc=\"$(date -u)\"" \
+                > "${VERSION_MANIFEST_FILE}"
+              cat $VERSION_MANIFEST_FILE
+            displayName: Generate build metadata
+          - publish: "$(Build.ArtifactStagingDirectory)/metadata"
+            displayName: "Publish build metadata"
+            artifact: metadata
+  - stage: BuildImage
+    displayName: Build images
+    dependsOn: PreBuild
+    jobs:
+      - job: BuildApp
+        displayName: Build App
+        pool:
+          name: Azure Pipelines
+        steps:
+          - download: current
+            artifact: metadata
+            displayName: Download metadata
+          - bash: |
+              export ARTIFACT_PATH=${1:-"$(Agent.BuildDirectory)/metadata/public"}
+              export TARGET_PATH=${2:-"$(Build.SourcesDirectory)"}
+              echo $(ls $ARTIFACT_PATH)
+              cp -r $ARTIFACT_PATH $TARGET_PATH
+              echo $(ls $TARGET_PATH)
+            displayName: Copy metadata into build
+          - task: Docker@2
+            displayName: Build and push docker image
+            inputs:
+              command: build
+              dockerfile: "$(dockerfilePath)"
+              buildContext: "$(Build.SourcesDirectory)"
+              repository: $(imageRepository)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              # arguments: '--build-arg NEXT_PUBLIC_APPLICATION_BASE_PATH=/dashboard'
+              tags: |
+                $(versionTag)
+                $(sha)
+          - task: Docker@2
+            displayName: Build and push docker image
+            inputs:
+              command: push
+              # dockerfile: "$(dockerfilePath)"
+              # buildContext: "$(Build.SourcesDirectory)"
+              repository: $(imageRepository)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(versionTag)
+                $(sha)
